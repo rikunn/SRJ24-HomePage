@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Live Stream Map Overlay</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRS9BMY=" crossorigin=""/>
+
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 1920px;
+            height: 1080px;
+            background-color: transparent;
+            overflow: hidden;
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #overlay-container {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 450px; 
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+
+        /* マップ表示領域（マスク） */
+        #map-wrapper {
+            width: 450px;
+            height: 350px;
+            border-radius: 10px;
+            overflow: hidden; 
+            position: relative;
+            background: rgba(0, 0, 0, 0.2);
+            border: 2px solid rgba(255, 255, 255, 0.5);
+            box-shadow: 0 0 10px rgba(0,0,0,0.5);
+        }
+
+        /* 実際に回転・移動するマップ要素 */
+        #map {
+            width: 150%; 
+            height: 150%;
+            top: -25%; 
+            left: -25%; 
+            position: absolute;
+            background: transparent;
+        }
+
+        .info-panel {
+            margin-top: 5px;
+            color: white;
+            text-align: right;
+            font-weight: bold;
+            text-shadow: 2px 2px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000;
+            font-size: 24px;
+            line-height: 1.4;
+            width: 100%;
+        }
+
+        .coordinates {
+            font-family: 'Courier New', Courier, monospace;
+        }
+
+        /* Leafletカスタマイズ */
+        .leaflet-control-container { display: none; } /* コントロール非表示 */
+        .leaflet-container { background: transparent; }
+
+        /* 時間帯による明度制御用クラス */
+        .tiles-day { filter: brightness(1.0); }
+        .tiles-night { filter: brightness(0.6) contrast(1.2); }
+    </style>
+</head>
+<body>
+
+    <div id="overlay-container">
+        <div id="map-wrapper">
+            <div id="map"></div>
+        </div>
+        <div class="info-panel">
+            <div id="speed-dist">0km/h (計 0.0km)</div>
+            <div id="coords" class="coordinates">00.0000 / 000.0000</div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script>
+        // 設定
+        const ASSETS = {
+            geoJson: 'assets/japan.geojson',
+            pointIcon: 'assets/point.png'
+        };
+        
+        // 状態管理
+        let map;
+        let marker;
+        let polyline;
+        let pathCoordinates = [];
+        let totalDistance = 0; // meters
+        let lastLat = null;
+        let lastLng = null;
+        let currentHeading = 0;
+
+        // 初期化
+        function init() {
+            // マップ初期化 (ズーム15, コントロールなし)
+            map = L.map('map', {
+                zoomControl: false,
+                attributionControl: false,
+                background: false
+            }).setView([35.6895, 139.6917], 15);
+
+            // 時間帯チェック
+            const hour = new Date().getHours();
+            const isNight = (hour >= 18 || hour < 6);
+            const tileClass = isNight ? 'tiles-night' : 'tiles-day';
+
+            // 国土地理院地図 (標準)
+            L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', {
+                maxZoom: 18,
+                className: tileClass,
+                opacity: 0.9
+            }).addTo(map);
+
+            // GeoJSON読み込み (県境)
+            fetch(ASSETS.geoJson)
+                .then(response => {
+                    if(!response.ok) throw new Error("GeoJSON not found");
+                    return response.json();
+                })
+                .then(data => {
+                    L.geoJSON(data, {
+                        style: {
+                            color: isNight ? '#aaa' : '#555', // 夜は少し明るい線、昼は暗い線
+                            weight: 2,
+                            opacity: 0.6,
+                            fill: false
+                        }
+                    }).addTo(map);
+                })
+                .catch(e => console.log('GeoJSON load skipped or failed: ' + e));
+
+            // 現在位置アイコン設定
+            const icon = L.icon({
+                iconUrl: ASSETS.pointIcon,
+                iconSize: [40, 40],
+                iconAnchor: [20, 20]
+            });
+
+            // マーカー配置 (初期値)
+            marker = L.marker([35.6895, 139.6917], {icon: icon, zIndexOffset: 1000}).addTo(map);
+
+            // 軌跡ライン (赤)
+            polyline = L.polyline([], {color: 'red', weight: 5, opacity: 0.8}).addTo(map);
+
+            // 位置情報監視開始
+            startTracking();
+            // コンパス監視開始
+            startCompass();
+        }
+
+        function startTracking() {
+            if (!navigator.geolocation) {
+                document.getElementById('coords').innerText = "GPS Not Supported";
+                return;
+            }
+
+            navigator.geolocation.watchPosition(
+                (position) => {
+                    const lat = position.coords.latitude;
+                    const lng = position.coords.longitude;
+                    const speedMs = position.coords.speed || 0; // m/s
+                    const speedKmh = (speedMs * 3.6).toFixed(0); // km/h
+
+                    updateMapPosition(lat, lng);
+                    updateStats(lat, lng, speedKmh);
+                },
+                (error) => {
+                    console.error("GPS Error", error);
+                },
+                {
+                    enableHighAccuracy: true,
+                    maximumAge: 0,
+                    timeout: 10000
+                }
+            );
+        }
+
+        function updateMapPosition(lat, lng) {
+            const newLatLng = new L.LatLng(lat, lng);
+
+            // 距離計算と加算
+            if (lastLat !== null && lastLng !== null) {
+                const dist = map.distance([lastLat, lastLng], newLatLng); // meters
+                // 異常値除外 (瞬時に飛びすぎた場合は無視するなど必要なら追加)
+                if (dist > 0.5) { // 少しでも動いたら
+                    totalDistance += dist;
+                }
+            }
+
+            lastLat = lat;
+            lastLng = lng;
+
+            // 軌跡更新
+            pathCoordinates.push(newLatLng);
+            polyline.setLatLngs(pathCoordinates);
+
+            // マーカー移動
+            marker.setLatLng(newLatLng);
+
+            // マップ中心移動
+            map.panTo(newLatLng, {animate: false});
+        }
+
+        function updateStats(lat, lng, speedKmh) {
+            // 距離表示 (km)
+            const totalDistKm = (totalDistance / 1000).toFixed(1);
+            
+            // DOM更新
+            document.getElementById('speed-dist').innerText = `${speedKmh}km/h (計 ${totalDistKm}km)`;
+            document.getElementById('coords').innerText = `${lat.toFixed(5)} / ${lng.toFixed(5)}`;
+        }
+
+        // コンパス処理 (マップ回転)
+        function startCompass() {
+            // iOS 13+ 対応
+            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+                DeviceOrientationEvent.requestPermission()
+                    .then(response => {
+                        if (response === 'granted') {
+                            window.addEventListener('deviceorientation', handleOrientation);
+                        }
+                    })
+                    .catch(console.error);
+            } else {
+                window.addEventListener('deviceorientation', handleOrientation);
+            }
+        }
+
+        function handleOrientation(event) {
+            let heading = 0;
+
+            if (event.webkitCompassHeading) {
+                // iOS
+                heading = event.webkitCompassHeading;
+            } else if (event.alpha) {
+                // Android (absolute check required but simplified here)
+                heading = 360 - event.alpha;
+            }
+
+            // マップ全体を回転させてヘディングアップにする
+            // 現在位置を中心に回転させるため、#map div全体をCSS transformで回す
+            const mapDiv = document.getElementById('map');
+            
+            // 回転方向は逆にする（地図を回して進行方向を上にするため）
+            mapDiv.style.transform = `rotate(-${heading}deg)`;
+            
+            // 注: マーカー等も一緒に回転してしまうが、アイコンが円形なら違和感は少ない。
+            // 本格的なHeadUp対応はMapbox GL JS等が必要だが、Leafletでの簡易実装はこれが限界。
+        }
+
+        window.onload = init;
+
+    </script>
+</body>
+</html>
